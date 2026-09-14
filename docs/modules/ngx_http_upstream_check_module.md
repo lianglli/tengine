@@ -290,7 +290,7 @@ Things to be aware of:
 
 Below it's the sample of csv page:
 
-    0,backend,192.168.0.1:80,up,46,0,http,80
+    0,backend,192.168.0.1:80,up,46,0,http,80,http
 
 Below it's the sample of json page:
 
@@ -298,7 +298,7 @@ Below it's the sample of json page:
       "total": 1,
       "generation": 3,
       "server": [
-       {"index": 0, "upstream": "backend", "name": "192.168.0.1:80", "status": "up", "rise": 58, "fall": 0, "type": "http", "port": 80}
+       {"index": 0, "upstream": "backend", "name": "192.168.0.1:80", "status": "up", "rise": 58, "fall": 0, "type": "http", "port": 80, "protocol": "http"}
       ]
      }}
 

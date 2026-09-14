@@ -111,11 +111,11 @@ Context: `upstream`
 
 ## check\_fastcgi\_param ##
 
-Syntax: **check\_fastcgi\_params** `parameter`:`value`
+Syntax: **check\_fastcgi\_param** `parameter` `value`
 
-Default: `REQUEST_METHOD: GET`
-         `REQUEST_URI: /`
-         `SCRIPT_FILENAME: index.php'
+Default: `REQUEST_METHOD GET`
+         `REQUEST_URI /`
+         `SCRIPT_FILENAME index.php`
 
 Context: `upstream`
 
