@@ -10,6 +10,7 @@
 
 #include "ngx_upstream_check_module.h"
 #include "ngx_http_upstream_check_http_parse.h"
+#include "ngx_upstream_check_send_parse.h"
 
 
 /*
@@ -3309,71 +3310,25 @@ ngx_http_upstream_check_send_init(ngx_http_upstream_check_peer_t *peer)
 }
 
 
-/*
- * Locates a byte string inside another one. Unlike ngx_strnstr() this is safe
- * on arbitrary bytes, including embedded zeros, which is the point of the
- * "send" type.
- */
-static u_char *
-ngx_http_upstream_check_memmem(u_char *haystack, size_t hlen, u_char *needle,
-    size_t nlen)
-{
-    u_char  *p, *last;
-
-    if (nlen == 0) {
-        return haystack;
-    }
-
-    if (hlen < nlen) {
-        return NULL;
-    }
-
-    last = haystack + (hlen - nlen);
-
-    for (p = haystack; p <= last; p++) {
-        if (*p == *needle && ngx_memcmp(p, needle, nlen) == 0) {
-            return p;
-        }
-    }
-
-    return NULL;
-}
-
-
 static ngx_int_t
 ngx_http_upstream_check_send_parse(ngx_http_upstream_check_peer_t *peer)
 {
-    size_t                               size;
     ngx_http_upstream_check_ctx_t       *ctx;
     ngx_http_upstream_check_srv_conf_t  *ucscf;
 
     ctx = peer->check_data;
     ucscf = peer->conf;
 
-    size = ctx->recv.last - ctx->recv.pos;
-
-    if (size == 0) {
-        return NGX_AGAIN;
-    }
-
-    /* without an expectation, any response at all means the peer is alive */
-    if (ucscf->expect.len == 0) {
-        return NGX_OK;
-    }
-
-    if (ngx_http_upstream_check_memmem(ctx->recv.pos, size,
-                                       ucscf->expect.data, ucscf->expect.len)
-        != NULL)
-    {
-        return NGX_OK;
-    }
-
     /*
-     * Keep reading: the expected bytes may still be split across reads. The
-     * verdict is left to the check timeout, which is what marks the peer down
-     * when the response never contains them.
+     * The verdict itself lives in ngx_upstream_check_send_parse.h so that it
+     * can be unit-tested without an nginx build. It never returns NGX_ERROR:
+     * a reply that does not (yet) contain the expected bytes leaves the peer
+     * undecided, and the check timeout is what fails it.
      */
-    return NGX_AGAIN;
+    return ngx_upstream_check_send_verdict(ctx->recv.pos,
+                                           ctx->recv.last - ctx->recv.pos,
+                                           ucscf->expect.data,
+                                           ucscf->expect.len);
 }
 
 
@@ -4540,53 +4495,27 @@ ngx_http_upstream_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 /*
- * Decodes \xHH into a raw byte, passing everything else through. The
- * configuration parser already turned \r, \n, \t and \\ into their bytes, so
- * this only adds what is needed to spell out a binary payload.
+ * Allocates and decodes a directive value. The decoding itself lives in
+ * ngx_upstream_check_send_parse.h so that it can be unit-tested without an
+ * nginx build; the output is never longer than the input.
  */
 static ngx_int_t
 ngx_http_upstream_check_unescape(ngx_conf_t *cf, ngx_str_t *dst,
     ngx_str_t *src)
 {
-    u_char      *p, *last, *d;
-    ngx_uint_t   hi, lo;
-
     if (src->len == 0) {
         dst->len = 0;
         dst->data = NULL;
         return NGX_OK;
     }
 
-    d = ngx_pnalloc(cf->pool, src->len);
-    if (d == NULL) {
+    dst->data = ngx_pnalloc(cf->pool, src->len);
+    if (dst->data == NULL) {
         return NGX_ERROR;
     }
 
-    dst->data = d;
-
-    p = src->data;
-    last = src->data + src->len;
-
-    while (p < last) {
-
-        if (p[0] != '\\' || last - p < 4 || (p[1] != 'x' && p[1] != 'X')) {
-            *d++ = *p++;
-            continue;
-        }
-
-        hi = ngx_hextoi(&p[2], 1);
-        lo = ngx_hextoi(&p[3], 1);
-
-        if (hi == (ngx_uint_t) NGX_ERROR || lo == (ngx_uint_t) NGX_ERROR) {
-            *d++ = *p++;
-            continue;
-        }
-
-        *d++ = (u_char) ((hi << 4) + lo);
-        p += 4;
-    }
-
-    dst->len = d - dst->data;
+    ngx_upstream_check_unescape_bytes(dst->data, &dst->len, src->data,
+                                      src->len);
 
     return NGX_OK;
 }

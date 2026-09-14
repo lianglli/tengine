@@ -24,7 +24,7 @@ use Test::Nginx::Stream qw/ stream /;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/stream http upstream_check/)->plan(10)
+my $t = Test::Nginx->new()->has(qw/stream http upstream_check/)->plan(16)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -181,12 +181,101 @@ select undef, undef, undef, 1;
 like(get_status(), qr!^\d+,u_late,127\.0\.0\.1:@{[port(8086)]},up,!m,
 	'peer comes back up once it listens');
 
+# The remaining status formats must label stream peers too. CSV is covered
+# above; here the peer registered by a stream upstream has to be told apart
+# from the HTTP ones in each of the other three renderings.
+like(get_status('html'), qr!<td>stream</td>!,
+	'html format labels the stream peer');
+like(get_status('json'),
+	qr!"upstream":\s*"u_rr".*?"protocol":\s*"stream"!,
+	'json format labels the stream peer');
+like(get_status('prometheus'),
+	qr!nginx_upstream_server_active\{[^}]*upstream="u_rr"[^}]*protocol="stream"[^}]*\}!,
+	'prometheus format labels the stream peer');
+
+# The check type must be rejected on the side it makes no sense for. The last
+# case is the control: it proves a rejection above is the type being refused
+# and not the surrounding configuration being malformed.
+my $testdir = $t->testdir();
+
+ok(!config_accepted(stream_conf('type=http'), $testdir),
+	'"type=http" is refused in a stream upstream');
+ok(!config_accepted(http_conf('type=udp'), $testdir),
+	'"type=udp" is refused in an http upstream');
+ok(config_accepted(stream_conf('type=tcp'), $testdir),
+	'"type=tcp" is accepted in a stream upstream');
+
 ###############################################################################
 
 sub get_status {
-	my $r = http_get('/status?format=csv');
+	my ($format) = @_;
+	$format = 'csv' unless defined $format;
+
+	my $r = http_get('/status?format=' . $format);
 	$r =~ s/.*?\x0d\x0a\x0d\x0a//s;
 	return $r;
+}
+
+# Runs "nginx -t" over a standalone configuration and reports whether it was
+# accepted, so that the check types refused on one side can be asserted.
+#
+# The test directory is passed in rather than reached through $t on purpose: a
+# sub closing over $t would keep the object alive until global destruction, and
+# the two assertions Test::Nginx makes when it is destroyed would then land
+# after Test::More has already compared the count against the plan.
+sub config_accepted {
+	my ($conf, $dir) = @_;
+
+	open my $fh, '>', "$dir/validate.conf" or die "open: $!";
+	print $fh $conf;
+	close $fh;
+
+	return system("$Test::Nginx::NGINX -t -p $dir -c $dir/validate.conf"
+		. " -e validate_error.log >/dev/null 2>&1") == 0;
+}
+
+sub stream_conf {
+	my ($check_args) = @_;
+
+	return <<"EOF";
+events {
+}
+
+stream {
+    upstream u {
+        server 127.0.0.1:@{[port(8081)]};
+        check interval=1000 rise=1 fall=1 timeout=500 $check_args;
+    }
+
+    server {
+        listen      127.0.0.1:@{[port(8099)]};
+        proxy_pass  u;
+    }
+}
+EOF
+}
+
+sub http_conf {
+	my ($check_args) = @_;
+
+	return <<"EOF";
+events {
+}
+
+http {
+    upstream u {
+        server 127.0.0.1:@{[port(8081)]};
+        check interval=1000 rise=1 fall=1 timeout=500 $check_args;
+    }
+
+    server {
+        listen      127.0.0.1:@{[port(8099)]};
+        location / {
+            proxy_pass http://u;
+        }
+    }
+}
+EOF
 }
 
 sub many {
