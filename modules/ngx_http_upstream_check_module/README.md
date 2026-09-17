@@ -380,6 +380,11 @@ upstream backend {
 
 `reload` 不受这个窗口影响：健康状态存在共享内存里，reload 会继承下来，不会退回初始状态。
 
+继承是按后端逐个对应的，判据是「所属 upstream + 注册它的模式（`http` / `stream`）+ 地址」三
+者。同一个后端地址被多个 upstream 列出时（也包括 `http` 和 `stream` 里同名的两个 upstream），
+每个 upstream 里的这个后端都有自己独立的一份状态，reload 时各自继承各自的，互不影响。唯一的
+例外是显式配了 `unique` 的后端，它们本来就共用一份状态。
+
 ## 与被动检查的关系
 
 主动检查生效后，不建议再依赖被动检查的参数（`max_fails` / `fail_timeout`）：两者判定口径

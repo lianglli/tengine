@@ -131,6 +131,17 @@ typedef struct {
 
     ngx_uint_t                               checksum;
 
+    /*
+     * Which upstream on which protocol side this record belongs to. The address
+     * alone does not identify a peer: the same server may appear in several
+     * upstreams, and the HTTP and the stream side share one shared memory zone,
+     * so an address occurs once per upstream that lists it. Inheriting state
+     * across a reload matches on this as well, otherwise every peer with that
+     * address would take over the state of whichever one came first.
+     */
+    ngx_uint_t                               upstream_hash;
+    ngx_uint_t                               protocol;
+
     struct sockaddr                         *sockaddr;
     socklen_t                                socklen;
 
@@ -381,7 +392,7 @@ static ngx_http_fastcgi_request_start_t  ngx_http_fastcgi_request_start = {
 
 static ngx_uint_t ngx_http_upstream_check_add_dynamic_peer_shm(
     ngx_pool_t *pool, ngx_http_upstream_check_srv_conf_t *ucscf,
-    ngx_addr_t *peer_addr);
+    ngx_str_t *upstream_name, ngx_addr_t *peer_addr, ngx_uint_t protocol);
 static void ngx_http_upstream_check_clear_dynamic_peer_shm(
     ngx_http_upstream_check_peer_shm_t *peer_shm);
 
@@ -540,9 +551,12 @@ static ngx_int_t ngx_http_upstream_check_get_shm_name(ngx_str_t *shm_name,
     ngx_pool_t *pool, ngx_uint_t generation);
 static ngx_shm_zone_t *ngx_shared_memory_find(ngx_cycle_t *cycle,
     ngx_str_t *name, void *tag);
+static ngx_uint_t ngx_http_upstream_check_upstream_hash(
+    ngx_str_t *upstream_name);
 static ngx_http_upstream_check_peer_shm_t *
 ngx_http_upstream_check_find_shm_peer(
-    ngx_http_upstream_check_peers_shm_t *peers_shm, ngx_addr_t *addr);
+    ngx_http_upstream_check_peers_shm_t *peers_shm, ngx_addr_t *addr,
+    ngx_uint_t upstream_hash, ngx_uint_t protocol);
 
 static ngx_int_t ngx_http_upstream_check_init_shm_peer(
     ngx_http_upstream_check_peer_shm_t *peer_shm,
@@ -943,8 +957,9 @@ ngx_upstream_check_add_dynamic_peer(ngx_pool_t *pool,
         return NGX_ERROR;
     }
 
-    index = ngx_http_upstream_check_add_dynamic_peer_shm(pool,
-                                                         ucscf, peer_addr);
+    index = ngx_http_upstream_check_add_dynamic_peer_shm(pool, ucscf,
+                                                         upstream_name,
+                                                         peer_addr, protocol);
     if (index == (ngx_uint_t) NGX_ERROR) {
         return index;
     }
@@ -1385,7 +1400,8 @@ ngx_http_upstream_check_delete_dynamic_peer(ngx_str_t *name,
 
 static ngx_uint_t
 ngx_http_upstream_check_add_dynamic_peer_shm(ngx_pool_t *pool,
-    ngx_http_upstream_check_srv_conf_t *ucscf, ngx_addr_t *peer_addr)
+    ngx_http_upstream_check_srv_conf_t *ucscf, ngx_str_t *upstream_name,
+    ngx_addr_t *peer_addr, ngx_uint_t protocol)
 {
     ngx_int_t                             rc;
     ngx_uint_t                            i, index;
@@ -1453,6 +1469,17 @@ ngx_http_upstream_check_add_dynamic_peer_shm(ngx_pool_t *pool,
 
     ngx_memcpy(peer_shm[index].sockaddr, peer_addr->sockaddr,
                peer_addr->socklen);
+
+    /*
+     * Record which upstream this peer belongs to, so that a later reload does
+     * not hand its state to an unrelated peer that happens to share the
+     * address. The merge loop above deliberately keeps looking at the address
+     * and the check request only: dynamically added peers sharing one record
+     * across upstreams is the behaviour this path always had.
+     */
+    peer_shm[index].upstream_hash =
+        ngx_http_upstream_check_upstream_hash(upstream_name);
+    peer_shm[index].protocol = protocol;
 
     rc = ngx_http_upstream_check_init_shm_peer(&peer_shm[index], NULL,
                                                ucscf->default_down, pool,
@@ -5443,10 +5470,16 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         ngx_memcpy(peer_shm->sockaddr, peer[i].peer_addr->sockaddr,
                    peer_shm->socklen);
 
+        peer_shm->upstream_hash =
+            ngx_http_upstream_check_upstream_hash(peer[i].upstream_name);
+        peer_shm->protocol = peer[i].protocol;
+
         if (opeers_shm) {
 
             opeer_shm = ngx_http_upstream_check_find_shm_peer(opeers_shm,
-                                                             peer[i].peer_addr);
+                                                    peer[i].peer_addr,
+                                                    peer_shm->upstream_hash,
+                                                    peer_shm->protocol);
             if (opeer_shm) {
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
                                "http upstream check, inherit opeer: %V ",
@@ -5527,9 +5560,16 @@ ngx_shared_memory_find(ngx_cycle_t *cycle, ngx_str_t *name, void *tag)
 }
 
 
+static ngx_uint_t
+ngx_http_upstream_check_upstream_hash(ngx_str_t *upstream_name)
+{
+    return ngx_murmur_hash2(upstream_name->data, upstream_name->len);
+}
+
+
 static ngx_http_upstream_check_peer_shm_t *
 ngx_http_upstream_check_find_shm_peer(ngx_http_upstream_check_peers_shm_t *p,
-    ngx_addr_t *addr)
+    ngx_addr_t *addr, ngx_uint_t upstream_hash, ngx_uint_t protocol)
 {
     ngx_uint_t                          i;
     ngx_http_upstream_check_peer_shm_t *peer_shm;
@@ -5537,6 +5577,12 @@ ngx_http_upstream_check_find_shm_peer(ngx_http_upstream_check_peers_shm_t *p,
     for (i = 0; i < p->number; i++) {
 
         peer_shm = &p->peers[i];
+
+        if (peer_shm->upstream_hash != upstream_hash
+            || peer_shm->protocol != protocol)
+        {
+            continue;
+        }
 
         if (addr->socklen != peer_shm->socklen) {
             continue;
