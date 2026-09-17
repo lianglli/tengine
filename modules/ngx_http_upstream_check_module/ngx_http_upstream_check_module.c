@@ -549,6 +549,7 @@ static char * ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf,
 
 static ngx_int_t ngx_http_upstream_check_get_shm_name(ngx_str_t *shm_name,
     ngx_pool_t *pool, ngx_uint_t generation);
+static ngx_uint_t ngx_upstream_check_shm_min_size(ngx_uint_t number);
 static ngx_shm_zone_t *ngx_shared_memory_find(ngx_cycle_t *cycle,
     ngx_str_t *name, void *tag);
 static ngx_uint_t ngx_http_upstream_check_upstream_hash(
@@ -5278,6 +5279,37 @@ ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf, void *parent,
 }
 
 
+/*
+ * Smallest zone that can hold the whole shared peer table: one record per
+ * configured peer, MAX_DYNAMIC_PEER spare records for peers added at runtime,
+ * a copy of the address of every one of them, and the slab pool's own
+ * overhead. The addresses of the spare records are counted too: they are
+ * allocated from this zone as peers appear, and a zone that only fits the
+ * records would let the table grow but not the addresses that go with it.
+ */
+static ngx_uint_t
+ngx_upstream_check_shm_min_size(ngx_uint_t number)
+{
+    ngx_uint_t  size, slots;
+
+    slots = number + MAX_DYNAMIC_PEER;
+
+    size = sizeof(ngx_http_upstream_check_peers_shm_t)
+           + (slots - 1) * sizeof(ngx_http_upstream_check_peer_shm_t)
+           + slots * ngx_align(sizeof(struct sockaddr_storage), NGX_ALIGNMENT);
+
+    /*
+     * The slab pool spends the head of the zone on its own header, the
+     * per-size slot lists and one ngx_slab_page_t per page, then aligns the
+     * first allocatable page up to a page boundary. One spare page covers the
+     * header, the lists and that rounding.
+     */
+    size += (size / ngx_pagesize) * sizeof(ngx_slab_page_t) + ngx_pagesize;
+
+    return ngx_align(size, ngx_pagesize);
+}
+
+
 char *
 ngx_upstream_check_init_shm(ngx_conf_t *cf, ngx_uint_t shm_size)
 {
@@ -5291,8 +5323,18 @@ ngx_upstream_check_init_shm(ngx_conf_t *cf, ngx_uint_t shm_size)
         return NGX_CONF_ERROR;
     }
 
-    /* The default check shared memory size is 1M */
-    size = 1 * 1024 * 1024;
+    /*
+     * The zone has to fit what ngx_http_upstream_check_init_shm_zone() is
+     * about to allocate out of it, so derive the floor from that instead of
+     * hardcoding one. The reservation for peers added at runtime alone is
+     * already close to a megabyte on 64-bit, which used to leave the old 1M
+     * default less than a page of slack: a per-peer record growing by a few
+     * bytes, or a host with larger pages, pushed the very first allocation
+     * past the end of the zone. That failure is fatal and independent of the
+     * configuration -- the reservation is made even when nothing is checked,
+     * so every configuration that merely links this module stopped starting.
+     */
+    size = ngx_upstream_check_shm_min_size(peers->peers.nelts);
 
     /*
      * Both sides may configure "check_shm_size"; the zone is sized by the
