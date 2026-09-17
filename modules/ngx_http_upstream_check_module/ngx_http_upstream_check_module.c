@@ -209,6 +209,15 @@ typedef struct {
     ngx_array_t                              peers;
     ngx_slab_pool_t                         *shpool;
 
+    /*
+     * The zone this container was registered with, and the largest
+     * "check_shm_size" seen so far from any protocol side. Both belong to the
+     * container rather than to a static, so that they are scoped to the
+     * configuration that owns it.
+     */
+    ngx_shm_zone_t                          *shm_zone;
+    ngx_uint_t                               shm_size_hint;
+
     ngx_http_upstream_check_peers_shm_t     *peers_shm;
 } ngx_http_upstream_check_peers_t;
 
@@ -903,11 +912,15 @@ static ngx_http_upstream_check_peers_t *check_peers_ctx = NULL;
  * one shared memory zone, one index space and one set of timers cover both
  * HTTP and stream upstreams. It is rebuilt once per cycle: whichever side
  * calls ngx_upstream_check_get_peers() first for a cycle creates it.
+ *
+ * check_peers_cycle only tells the current configuration apart from the
+ * previous one, it is not an identity: a cycle discarded by a failed reload is
+ * regularly reallocated at the same address by the next one. What keeps the
+ * two apart is the cleanup handler below, which drops these pointers as soon
+ * as the pool holding the container goes away.
  */
 static ngx_http_upstream_check_peers_t *check_peers_cur = NULL;
 static ngx_cycle_t                     *check_peers_cycle = NULL;
-static ngx_cycle_t                     *check_shm_inited_cycle = NULL;
-static ngx_uint_t                       check_shm_size_hint = 0;
 
 
 ngx_uint_t
@@ -4839,6 +4852,31 @@ ngx_http_upstream_check_status(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 /*
+ * Drops the per-configuration state once the pool holding the container is
+ * destroyed, which happens both when a reload fails and when the old cycle is
+ * finally torn down. Without this, a container left over from a failed reload
+ * would be picked up by the next one, whose cycle is regularly allocated at
+ * the very address the failed cycle had just freed: get_peers() would hand out
+ * freed memory and init_shm() would skip creating the zone altogether.
+ *
+ * The identity checks matter for the old-cycle teardown, which runs after the
+ * new configuration is already in place and must not clear its state.
+ */
+static void
+ngx_upstream_check_cleanup_peers(void *data)
+{
+    if (check_peers_cur == data) {
+        check_peers_cur = NULL;
+        check_peers_cycle = NULL;
+    }
+
+    if (check_peers_ctx == data) {
+        check_peers_ctx = NULL;
+    }
+}
+
+
+/*
  * Returns the cycle's container of checked peers, creating it on the first
  * call for a cycle. Both the HTTP and the stream module call this from their
  * create_main_conf so that peers from either side end up in one container --
@@ -4847,6 +4885,7 @@ ngx_http_upstream_check_status(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 void *
 ngx_upstream_check_get_peers(ngx_conf_t *cf)
 {
+    ngx_pool_cleanup_t               *cln;
     ngx_http_upstream_check_peers_t  *peers;
 
     if (check_peers_cycle == cf->cycle && check_peers_cur != NULL) {
@@ -4857,6 +4896,14 @@ ngx_upstream_check_get_peers(ngx_conf_t *cf)
     if (peers == NULL) {
         return NULL;
     }
+
+    cln = ngx_pool_cleanup_add(cf->pool, 0);
+    if (cln == NULL) {
+        return NULL;
+    }
+
+    cln->handler = ngx_upstream_check_cleanup_peers;
+    cln->data = peers;
 
     peers->checksum = 0;
 
@@ -4878,13 +4925,6 @@ ngx_upstream_check_get_peers(ngx_conf_t *cf)
 
     check_peers_cur = peers;
     check_peers_cycle = cf->cycle;
-
-    /*
-     * A fresh cycle starts over: "check_shm_size" is collected again from
-     * this cycle's configuration only, so dropping the directive on reload
-     * really does go back to the default size.
-     */
-    check_shm_size_hint = 0;
 
     return peers;
 }
@@ -5219,28 +5259,36 @@ ngx_upstream_check_init_shm(ngx_conf_t *cf, ngx_uint_t shm_size)
     ngx_shm_zone_t                   *shm_zone;
     ngx_http_upstream_check_peers_t  *peers;
 
-    /*
-     * Both sides may configure "check_shm_size"; the zone is sized by the
-     * larger of the two.
-     */
-    if (shm_size > check_shm_size_hint) {
-        check_shm_size_hint = shm_size;
-    }
-
-    /*
-     * Only the first side to reach this point for a cycle creates the zone.
-     * Bumping the generation twice would break the reload path, which looks
-     * the previous zone up by "generation - 1" to inherit peer health: the
-     * lookup would miss and every peer would fall back to default_down and be
-     * probed from scratch.
-     */
-    if (check_shm_inited_cycle == cf->cycle) {
-        return NGX_CONF_OK;
-    }
-
     peers = ngx_upstream_check_get_peers(cf);
     if (peers == NULL) {
         return NGX_CONF_ERROR;
+    }
+
+    /* The default check shared memory size is 1M */
+    size = 1 * 1024 * 1024;
+
+    /*
+     * Both sides may configure "check_shm_size"; the zone is sized by the
+     * larger of the two, whichever side got here first.
+     */
+    if (shm_size > peers->shm_size_hint) {
+        peers->shm_size_hint = shm_size;
+    }
+
+    if (size < peers->shm_size_hint) {
+        size = peers->shm_size_hint;
+    }
+
+    /*
+     * Only the first side to reach this point for a configuration creates the
+     * zone. Bumping the generation twice would break the reload path, which
+     * looks the previous zone up by "generation - 1" to inherit peer health:
+     * the lookup would miss and every peer would fall back to default_down and
+     * be probed from scratch.
+     */
+    if (peers->shm_zone != NULL) {
+        peers->shm_zone->shm.size = size;
+        return NGX_CONF_OK;
     }
 
     ngx_http_upstream_check_shm_generation++;
@@ -5250,13 +5298,11 @@ ngx_upstream_check_init_shm(ngx_conf_t *cf, ngx_uint_t shm_size)
     ngx_http_upstream_check_get_shm_name(shm_name, cf->pool,
                                 ngx_http_upstream_check_shm_generation);
 
-    /* The default check shared memory size is 1M */
-    size = 1 * 1024 * 1024;
-
-    size = size < check_shm_size_hint ? check_shm_size_hint : size;
-
     shm_zone = ngx_shared_memory_add(cf, shm_name, size,
                                      &ngx_http_upstream_check_module);
+    if (shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
                    "upstream check, upsteam:%V, shm_zone size:%ui",
@@ -5267,7 +5313,7 @@ ngx_upstream_check_init_shm(ngx_conf_t *cf, ngx_uint_t shm_size)
 
     shm_zone->init = ngx_http_upstream_check_init_shm_zone;
 
-    check_shm_inited_cycle = cf->cycle;
+    peers->shm_zone = shm_zone;
 
     return NGX_CONF_OK;
 }
